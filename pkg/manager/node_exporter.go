@@ -34,6 +34,13 @@ type NodeConditionConfig struct {
 	ReadyMessage string
 }
 
+// CaptureRequest is emitted when a managed condition transitions into a
+// failing (False) state, requesting that logs be captured for that condition.
+type CaptureRequest struct {
+	Condition corev1.NodeConditionType
+	Reason    string
+}
+
 // NewNodeExporter creates a new node exporter that updates Kubernetes node conditions
 func NewNodeExporter(
 	node *corev1.Node,
@@ -106,6 +113,18 @@ type nodeExporter struct {
 	// touches, so the condition reason can follow the most recent report
 	// while messages keep their arrival order.
 	reportSeq uint64
+
+	// captureCh receives a CaptureRequest when a managed condition flips into
+	// the failing state. A nil channel (the default) disables the feature.
+	captureCh chan<- CaptureRequest
+}
+
+// SetCaptureChannel turns on automatic log capture requests.
+// A nil channel (the default) means the feature is off.
+func (e *nodeExporter) SetCaptureChannel(ch chan<- CaptureRequest) {
+	e.managedConditionsLock.Lock()
+	defer e.managedConditionsLock.Unlock()
+	e.captureCh = ch
 }
 
 // fatalEntry is one unresolved fatal reason, its latest message, and the
@@ -153,7 +172,17 @@ func (e *nodeExporter) Fatal(ctx context.Context, monitorCondition monitor.Condi
 	}
 	e.fatalEntries[conditionType] = entries
 
+	old, ok := e.managedConditions[conditionType]
+	wasNotFalse := !ok || old.Status != corev1.ConditionFalse
+
 	e.rebuildFatalCondition(conditionType)
+
+	if wasNotFalse && e.captureCh != nil {
+		select {
+		case e.captureCh <- CaptureRequest{Condition: conditionType, Reason: monitorCondition.Reason}:
+		default:
+		}
+	}
 	return nil
 }
 

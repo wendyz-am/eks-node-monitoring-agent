@@ -59,6 +59,7 @@ var (
 	controllerPprofAddress       string
 	hostname                     string
 	verbosity                    int
+	logBucket                    string
 
 	legacyNodeRBAC bool
 )
@@ -202,6 +203,26 @@ func run() error {
 	// sources such as /var/log/cron.log, which never appears on Bottlerocket.
 	// Observer failures surface in MonitorManager.Start's logs.
 	registered := make(chan struct{})
+
+	// captureCh carries automatic log capture requests from the node exporter to
+	// the capture worker. It stays nil (feature off) unless a log bucket is set.
+	var captureCh chan manager.CaptureRequest
+	if logBucket != "" {
+		captureCh = make(chan manager.CaptureRequest, 4)
+		if err := mgr.Add(crmanager.RunnableFunc(func(ctx context.Context) error {
+			for {
+				select {
+				case req := <-captureCh:
+					logger.Info("would capture", "condition", req.Condition, "reason", req.Reason, "bucket", logBucket)
+				case <-ctx.Done():
+					return nil
+				}
+			}
+		})); err != nil {
+			logger.Error(err, "failed to add capture worker runnable")
+			return err
+		}
+	}
 
 	// The bootstrap poll below is unbounded, so the startup path runs as a manager
 	// Runnable: the manager serves its health probes before starting any Runnable,
@@ -351,6 +372,9 @@ func run() error {
 			monitoringEventRecorder,
 			conditionConfigs,
 		)
+		if captureCh != nil {
+			nodeExporter.SetCaptureChannel(captureCh)
+		}
 		go nodeExporter.Run(ctx)
 
 		// Initialize monitoring manager
@@ -470,6 +494,7 @@ func parseFlags() error {
 	flagSet.StringVar(&controllerMetricsAddress, "metrics-address", ":8080", "Address for the controller runtime metrics endpoint")
 	flagSet.StringVar(&controllerPprofAddress, "pprof-address", "", "Address for the controller runtime pprof endpoint (default disabled)")
 	flagSet.IntVarP(&verbosity, "verbosity", "v", 2, "Logging verbosity level")
+	flagSet.StringVar(&logBucket, "log-bucket", "", "S3 bucket for automatic log capture (empty = off)")
 	return flagSet.Parse(os.Args[1:])
 }
 

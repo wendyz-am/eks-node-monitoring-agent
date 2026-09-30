@@ -539,3 +539,229 @@ func TestNodeExporter_ReasonFollowsMostRecentReport(t *testing.T) {
 	fatal("ErrorA", "MessageA2")
 	expectCondition("ErrorA", "MessageA2; MessageB")
 }
+
+// recvCapture returns the next capture request without blocking. ok is false
+// when no request is queued, so a missing request fails a test rather than
+// hanging it.
+func recvCapture(ch <-chan manager.CaptureRequest) (manager.CaptureRequest, bool) {
+	select {
+	case req := <-ch:
+		return req, true
+	default:
+		return manager.CaptureRequest{}, false
+	}
+}
+
+func TestNodeExporter_CaptureOnFirstFatal(t *testing.T) {
+	ctx := context.TODO()
+	conditionType := corev1.NodeConditionType("NetworkingReady")
+	fakeClient := fake.NewFakeClient()
+	initialNode := corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: "test-node"}}
+	if err := fakeClient.Create(ctx, &initialNode); err != nil {
+		t.Fatal(err)
+	}
+	var recorder fakeEventRecorder
+	nodeExporter := manager.NewNodeExporter(
+		&initialNode,
+		fakeClient,
+		&recorder,
+		map[corev1.NodeConditionType]manager.NodeConditionConfig{
+			conditionType: {ReadyReason: "NetworkingIsReady", ReadyMessage: "Monitoring is active"},
+		},
+	)
+
+	captureCh := make(chan manager.CaptureRequest, 4)
+	nodeExporter.SetCaptureChannel(captureCh)
+
+	if err := nodeExporter.Fatal(ctx, monitor.Condition{Reason: "ErrorA", Message: "MessageA"}, conditionType); err != nil {
+		t.Fatal(err)
+	}
+
+	req, ok := recvCapture(captureCh)
+	if !ok {
+		t.Fatal("expected a capture request after the first Fatal")
+	}
+	if req.Condition != conditionType {
+		t.Errorf("expected condition %q, got %q", conditionType, req.Condition)
+	}
+	if _, ok := recvCapture(captureCh); ok {
+		t.Fatal("expected exactly one capture request")
+	}
+}
+
+func TestNodeExporter_CaptureNotRepeatedSameReason(t *testing.T) {
+	ctx := context.TODO()
+	conditionType := corev1.NodeConditionType("NetworkingReady")
+	fakeClient := fake.NewFakeClient()
+	initialNode := corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: "test-node"}}
+	if err := fakeClient.Create(ctx, &initialNode); err != nil {
+		t.Fatal(err)
+	}
+	var recorder fakeEventRecorder
+	nodeExporter := manager.NewNodeExporter(
+		&initialNode,
+		fakeClient,
+		&recorder,
+		map[corev1.NodeConditionType]manager.NodeConditionConfig{
+			conditionType: {ReadyReason: "NetworkingIsReady", ReadyMessage: "Monitoring is active"},
+		},
+	)
+
+	captureCh := make(chan manager.CaptureRequest, 4)
+	nodeExporter.SetCaptureChannel(captureCh)
+
+	for i := 0; i < 2; i++ {
+		if err := nodeExporter.Fatal(ctx, monitor.Condition{Reason: "ErrorA", Message: "MessageA"}, conditionType); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	if _, ok := recvCapture(captureCh); !ok {
+		t.Fatal("expected a capture request after the first Fatal")
+	}
+	if _, ok := recvCapture(captureCh); ok {
+		t.Fatal("expected no second capture request while condition stays False")
+	}
+}
+
+func TestNodeExporter_CaptureNotRepeatedNewReasonWhileFalse(t *testing.T) {
+	ctx := context.TODO()
+	conditionType := corev1.NodeConditionType("NetworkingReady")
+	fakeClient := fake.NewFakeClient()
+	initialNode := corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: "test-node"}}
+	if err := fakeClient.Create(ctx, &initialNode); err != nil {
+		t.Fatal(err)
+	}
+	var recorder fakeEventRecorder
+	nodeExporter := manager.NewNodeExporter(
+		&initialNode,
+		fakeClient,
+		&recorder,
+		map[corev1.NodeConditionType]manager.NodeConditionConfig{
+			conditionType: {ReadyReason: "NetworkingIsReady", ReadyMessage: "Monitoring is active"},
+		},
+	)
+
+	captureCh := make(chan manager.CaptureRequest, 4)
+	nodeExporter.SetCaptureChannel(captureCh)
+
+	if err := nodeExporter.Fatal(ctx, monitor.Condition{Reason: "ErrorA", Message: "MessageA"}, conditionType); err != nil {
+		t.Fatal(err)
+	}
+	if err := nodeExporter.Fatal(ctx, monitor.Condition{Reason: "ErrorB", Message: "MessageB"}, conditionType); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, ok := recvCapture(captureCh); !ok {
+		t.Fatal("expected a capture request after the first Fatal")
+	}
+	if _, ok := recvCapture(captureCh); ok {
+		t.Fatal("expected no capture request for a new reason while condition is already False")
+	}
+}
+
+func TestNodeExporter_CaptureAgainAfterResolve(t *testing.T) {
+	ctx := context.TODO()
+	conditionType := corev1.NodeConditionType("NetworkingReady")
+	fakeClient := fake.NewFakeClient()
+	initialNode := corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: "test-node"}}
+	if err := fakeClient.Create(ctx, &initialNode); err != nil {
+		t.Fatal(err)
+	}
+	var recorder fakeEventRecorder
+	nodeExporter := manager.NewNodeExporter(
+		&initialNode,
+		fakeClient,
+		&recorder,
+		map[corev1.NodeConditionType]manager.NodeConditionConfig{
+			conditionType: {ReadyReason: "NetworkingIsReady", ReadyMessage: "Monitoring is active"},
+		},
+	)
+
+	captureCh := make(chan manager.CaptureRequest, 4)
+	nodeExporter.SetCaptureChannel(captureCh)
+
+	if err := nodeExporter.Fatal(ctx, monitor.Condition{Reason: "ErrorA", Message: "MessageA"}, conditionType); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := nodeExporter.Resolve(ctx, monitor.Condition{Reason: "ErrorA"}, conditionType); err != nil {
+		t.Fatal(err)
+	}
+	if err := nodeExporter.Fatal(ctx, monitor.Condition{Reason: "ErrorA", Message: "MessageA"}, conditionType); err != nil {
+		t.Fatal(err)
+	}
+
+	count := 0
+	for {
+		if _, ok := recvCapture(captureCh); !ok {
+			break
+		}
+		count++
+	}
+	if count != 2 {
+		t.Fatalf("expected 2 capture requests (Fatal, Resolve, Fatal), got %d", count)
+	}
+}
+
+func TestNodeExporter_FatalDoesNotBlockOnFullChannel(t *testing.T) {
+	ctx := context.TODO()
+	conditionType := corev1.NodeConditionType("NetworkingReady")
+	fakeClient := fake.NewFakeClient()
+	initialNode := corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: "test-node"}}
+	if err := fakeClient.Create(ctx, &initialNode); err != nil {
+		t.Fatal(err)
+	}
+	var recorder fakeEventRecorder
+	nodeExporter := manager.NewNodeExporter(
+		&initialNode,
+		fakeClient,
+		&recorder,
+		map[corev1.NodeConditionType]manager.NodeConditionConfig{
+			conditionType: {ReadyReason: "NetworkingIsReady", ReadyMessage: "Monitoring is active"},
+		},
+	)
+
+	// A full channel of size 1 must never block Fatal, which holds the
+	// managedConditionsLock while it attempts the send.
+	captureCh := make(chan manager.CaptureRequest, 1)
+	captureCh <- manager.CaptureRequest{Condition: conditionType, Reason: "prefill"}
+	nodeExporter.SetCaptureChannel(captureCh)
+
+	done := make(chan error, 1)
+	go func() {
+		done <- nodeExporter.Fatal(ctx, monitor.Condition{Reason: "ErrorA", Message: "MessageA"}, conditionType)
+	}()
+
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(1 * time.Second):
+		t.Fatal("Fatal blocked on a full capture channel")
+	}
+}
+
+func TestNodeExporter_FatalWithoutCaptureChannel(t *testing.T) {
+	ctx := context.TODO()
+	conditionType := corev1.NodeConditionType("NetworkingReady")
+	fakeClient := fake.NewFakeClient()
+	initialNode := corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: "test-node"}}
+	if err := fakeClient.Create(ctx, &initialNode); err != nil {
+		t.Fatal(err)
+	}
+	var recorder fakeEventRecorder
+	nodeExporter := manager.NewNodeExporter(
+		&initialNode,
+		fakeClient,
+		&recorder,
+		map[corev1.NodeConditionType]manager.NodeConditionConfig{
+			conditionType: {ReadyReason: "NetworkingIsReady", ReadyMessage: "Monitoring is active"},
+		},
+	)
+
+	// No SetCaptureChannel call: Fatal must work and not panic.
+	if err := nodeExporter.Fatal(ctx, monitor.Condition{Reason: "ErrorA", Message: "MessageA"}, conditionType); err != nil {
+		t.Fatal(err)
+	}
+}
