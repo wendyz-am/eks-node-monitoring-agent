@@ -32,6 +32,7 @@ import (
 	"github.com/aws/eks-node-monitoring-agent/api/monitor"
 	"github.com/aws/eks-node-monitoring-agent/api/v1alpha1"
 	"github.com/aws/eks-node-monitoring-agent/internal/version"
+	"github.com/aws/eks-node-monitoring-agent/pkg/autocapture"
 	"github.com/aws/eks-node-monitoring-agent/pkg/conditions"
 	"github.com/aws/eks-node-monitoring-agent/pkg/config"
 	"github.com/aws/eks-node-monitoring-agent/pkg/controllers"
@@ -210,10 +211,26 @@ func run() error {
 	if logBucket != "" {
 		captureCh = make(chan manager.CaptureRequest, 4)
 		if err := mgr.Add(crmanager.RunnableFunc(func(ctx context.Context) error {
+			// One capture at a time: each request is handled fully before the
+			// loop reads the next.
 			for {
 				select {
 				case req := <-captureCh:
-					logger.Info("would capture", "condition", req.Condition, "reason", req.Reason, "bucket", logBucket)
+					ctxCap, cancel := context.WithTimeout(ctx, 5*time.Minute)
+					logger.Info("capture started", "condition", req.Condition, "reason", req.Reason)
+					start := time.Now()
+					var path string
+					archive, failed, err := autocapture.Collect(ctxCap, runtimeContext, autocapture.CategoriesFor(req.Condition))
+					if err == nil {
+						path, err = autocapture.SaveToHost(archive, req.Condition, time.Now())
+					}
+					cancel()
+					if err != nil {
+						logger.Error(err, "capture failed", "condition", req.Condition)
+					} else {
+						logger.Info("capture saved", "condition", req.Condition,
+							"path", path, "failedCollectors", failed, "seconds", time.Since(start).Seconds())
+					}
 				case <-ctx.Done():
 					return nil
 				}
