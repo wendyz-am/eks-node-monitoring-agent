@@ -12,7 +12,6 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
-	"time"
 
 	corev1 "k8s.io/api/core/v1"
 	"sigs.k8s.io/controller-runtime/pkg/log"
@@ -100,40 +99,4 @@ func Collect(ctx context.Context, runtimeContext *config.RuntimeContext, categor
 	}
 
 	return archiveReader, subTasksFailed, nil
-}
-
-// hostDir returns the directory on the node where auto-capture archives are
-// written. It is a var so tests can redirect writes to a temp directory.
-var hostDir = func() string {
-	return filepath.Join(config.HostRoot(), "tmp", "nma-auto-capture")
-}
-
-// SaveToHost writes the archive to the node's disk under hostDir() using a
-// timestamped, condition-tagged filename, and returns the full path.
-//
-// POC only: this will be replaced by the S3 upload in Step 3.
-func SaveToHost(archive io.Reader, condition corev1.NodeConditionType, now time.Time) (string, error) {
-	return saveToDir(hostDir(), archive, condition, now)
-}
-
-// saveToDir performs the write into an explicit directory. SaveToHost is a thin
-// wrapper that supplies the host directory; tests exercise this directly.
-func saveToDir(dir string, archive io.Reader, condition corev1.NodeConditionType, now time.Time) (string, error) {
-	if err := os.MkdirAll(dir, 0755); err != nil {
-		return "", fmt.Errorf("failed creating capture directory: %s", err)
-	}
-
-	name := now.UTC().Format("20060102T150405Z") + "-" + string(condition) + ".tar.gz"
-	path := filepath.Join(dir, name)
-
-	f, err := os.Create(path)
-	if err != nil {
-		return "", fmt.Errorf("failed creating capture file: %s", err)
-	}
-	defer f.Close()
-
-	if _, err := io.Copy(f, archive); err != nil {
-		return "", fmt.Errorf("failed writing capture file: %s", err)
-	}
-	return path, nil
 }
