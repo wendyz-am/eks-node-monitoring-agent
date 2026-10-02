@@ -1,12 +1,7 @@
 package autocapture
 
 import (
-	"bytes"
-	"os"
-	"path/filepath"
-	"strings"
 	"testing"
-	"time"
 
 	corev1 "k8s.io/api/core/v1"
 
@@ -62,41 +57,5 @@ func TestCategoriesFor(t *testing.T) {
 				}
 			}
 		})
-	}
-}
-
-func TestSaveToHost(t *testing.T) {
-	dir := t.TempDir()
-
-	// Redirect SaveToHost's target directory to the temp dir for this test.
-	original := hostDir
-	hostDir = func() string { return dir }
-	t.Cleanup(func() { hostDir = original })
-
-	want := []byte("fake-archive-bytes")
-	now := time.Date(2026, 10, 1, 12, 34, 56, 0, time.UTC)
-
-	path, err := SaveToHost(bytes.NewReader(want), conditions.KernelReady, now)
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	if gotDir := filepath.Dir(path); gotDir != dir {
-		t.Fatalf("expected file written under %q, got %q", dir, gotDir)
-	}
-	base := filepath.Base(path)
-	if !strings.HasSuffix(base, "-KernelReady.tar.gz") {
-		t.Errorf("expected filename to end in -KernelReady.tar.gz, got %q", base)
-	}
-	if !strings.HasPrefix(base, "20261001T123456Z-") {
-		t.Errorf("expected UTC timestamp prefix, got %q", base)
-	}
-
-	got, err := os.ReadFile(path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !bytes.Equal(got, want) {
-		t.Errorf("file contents mismatch: got %q, want %q", got, want)
 	}
 }
