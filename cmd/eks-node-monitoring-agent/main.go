@@ -211,25 +211,41 @@ func run() error {
 	if logBucket != "" {
 		captureCh = make(chan manager.CaptureRequest, 4)
 		if err := mgr.Add(crmanager.RunnableFunc(func(ctx context.Context) error {
+			// Build the S3 client once. A failure here is not fatal: the worker
+			// keeps draining the channel so a transient startup problem never
+			// stops the agent, and uploads simply fail until it recovers.
+			s3Client, clientErr := autocapture.NewS3Client(ctx)
+			if clientErr != nil {
+				logger.Error(clientErr, "s3 client unavailable, captures will not be uploaded")
+			}
+
 			// One capture at a time: each request is handled fully before the
-			// loop reads the next.
+			// loop reads the next. This Runnable must only ever return nil (on
+			// ctx.Done); returning an error would stop the whole agent.
 			for {
 				select {
 				case req := <-captureCh:
 					ctxCap, cancel := context.WithTimeout(ctx, 5*time.Minute)
 					logger.Info("capture started", "condition", req.Condition, "reason", req.Reason)
 					start := time.Now()
-					var path string
+					var key string
 					archive, failed, err := autocapture.Collect(ctxCap, runtimeContext, autocapture.CategoriesFor(req.Condition))
+					if err == nil && s3Client == nil {
+						err = errors.New("s3 client unavailable")
+					}
 					if err == nil {
-						path, err = autocapture.SaveToHost(archive, req.Condition, time.Now())
+						ctxUp, cancelUp := context.WithTimeout(ctxCap, 2*time.Minute)
+						key = autocapture.ObjectKey(hostname, req.Condition, time.Now())
+						err = autocapture.Upload(ctxUp, s3Client, logBucket, key, archive)
+						cancelUp()
 					}
 					cancel()
 					if err != nil {
 						logger.Error(err, "capture failed", "condition", req.Condition)
 					} else {
-						logger.Info("capture saved", "condition", req.Condition,
-							"path", path, "failedCollectors", failed, "seconds", time.Since(start).Seconds())
+						logger.Info("capture uploaded", "condition", req.Condition,
+							"bucket", logBucket, "key", key,
+							"failedCollectors", failed, "seconds", time.Since(start).Seconds())
 					}
 				case <-ctx.Done():
 					return nil
