@@ -39,6 +39,8 @@ type NodeConditionConfig struct {
 type CaptureRequest struct {
 	Condition corev1.NodeConditionType
 	Reason    string
+	Message   string
+	At        time.Time
 }
 
 // NewNodeExporter creates a new node exporter that updates Kubernetes node conditions
@@ -179,7 +181,7 @@ func (e *nodeExporter) Fatal(ctx context.Context, monitorCondition monitor.Condi
 
 	if wasNotFalse && e.captureCh != nil {
 		select {
-		case e.captureCh <- CaptureRequest{Condition: conditionType, Reason: monitorCondition.Reason}:
+		case e.captureCh <- CaptureRequest{Condition: conditionType, Reason: monitorCondition.Reason, Message: monitorCondition.Message, At: time.Now()}:
 		default:
 		}
 	}

@@ -229,7 +229,11 @@ func run() error {
 					logger.Info("capture started", "condition", req.Condition, "reason", req.Reason)
 					start := time.Now()
 					var key string
-					archive, failed, err := autocapture.Collect(ctxCap, runtimeContext, autocapture.CategoriesFor(req.Condition))
+					trigger := autocapture.Trigger{
+						Condition: req.Condition, Reason: req.Reason, Message: req.Message,
+						At: req.At, Node: hostname, NMAVersion: version.String(),
+					}
+					archive, failed, err := autocapture.Collect(ctxCap, runtimeContext, autocapture.CategoriesFor(req.Condition), trigger)
 					if err == nil && s3Client == nil {
 						err = errors.New("s3 client unavailable")
 					}

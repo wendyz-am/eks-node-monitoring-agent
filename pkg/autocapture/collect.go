@@ -47,7 +47,7 @@ func CategoriesFor(condition corev1.NodeConditionType) []v1alpha1.LogCategory {
 // and an error. It mirrors the controller's collectLogs recipe: partial
 // collection failures are recorded in log-capture-errors.log inside the
 // archive rather than failing the whole capture.
-func Collect(ctx context.Context, runtimeContext *config.RuntimeContext, categories []v1alpha1.LogCategory) (io.Reader, int, error) {
+func Collect(ctx context.Context, runtimeContext *config.RuntimeContext, categories []v1alpha1.LogCategory, trigger Trigger) (io.Reader, int, error) {
 	logger := log.FromContext(ctx)
 
 	logDir, err := os.MkdirTemp("", "eks-log-collector-*")
@@ -55,6 +55,12 @@ func Collect(ctx context.Context, runtimeContext *config.RuntimeContext, categor
 		return nil, 0, fmt.Errorf("failed creating temp directory due to: %s", err)
 	}
 	defer os.RemoveAll(logDir)
+
+	// The trigger file explains why the bundle was captured. It is best-effort:
+	// a bundle without it is still useful, so never fail the capture over it.
+	if err := writeTrigger(logDir, trigger); err != nil {
+		logger.Error(err, "failed to write capture trigger file")
+	}
 
 	cfg := collect.Config{
 		Root:        config.HostRoot(),
