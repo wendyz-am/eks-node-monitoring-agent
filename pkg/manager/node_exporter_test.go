@@ -584,6 +584,12 @@ func TestNodeExporter_CaptureOnFirstFatal(t *testing.T) {
 	if req.Condition != conditionType {
 		t.Errorf("expected condition %q, got %q", conditionType, req.Condition)
 	}
+	if req.Message != "MessageA" {
+		t.Errorf("expected message %q, got %q", "MessageA", req.Message)
+	}
+	if req.At.IsZero() {
+		t.Error("expected capture request to carry a non-zero flip time")
+	}
 	if _, ok := recvCapture(captureCh); ok {
 		t.Fatal("expected exactly one capture request")
 	}
