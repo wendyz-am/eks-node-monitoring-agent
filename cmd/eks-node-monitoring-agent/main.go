@@ -61,6 +61,7 @@ var (
 	hostname                     string
 	verbosity                    int
 	logBucket                    string
+	logMaxBytes                  int64
 
 	legacyNodeRBAC bool
 )
@@ -211,12 +212,49 @@ func run() error {
 	if logBucket != "" {
 		captureCh = make(chan manager.CaptureRequest, 4)
 		if err := mgr.Add(crmanager.RunnableFunc(func(ctx context.Context) error {
-			// Build the S3 client once. A failure here is not fatal: the worker
+			// Build the uploader once. A failure here is not fatal: the worker
 			// keeps draining the channel so a transient startup problem never
 			// stops the agent, and uploads simply fail until it recovers.
-			s3Client, clientErr := autocapture.NewS3Client(ctx)
+			uploader, clientErr := autocapture.NewUploader(ctx)
 			if clientErr != nil {
 				logger.Error(clientErr, "s3 client unavailable, captures will not be uploaded")
+			}
+
+			// handleCapture runs one capture. It is a func literal so the temp
+			// dir and context are cleaned up per request via defer.
+			handleCapture := func(req manager.CaptureRequest) {
+				ctxCap, cancel := context.WithTimeout(ctx, 5*time.Minute)
+				defer cancel()
+
+				logger.Info("capture started", "condition", req.Condition, "reason", req.Reason)
+				start := time.Now()
+				var key string
+				trigger := autocapture.Trigger{
+					Condition: req.Condition, Reason: req.Reason, Message: req.Message,
+					At: req.At, Node: hostname, NMAVersion: version.String(),
+				}
+
+				dir, failed, err := autocapture.CollectToDir(ctxCap, runtimeContext, autocapture.CategoriesFor(req.Condition), trigger)
+				if dir != "" {
+					defer os.RemoveAll(dir)
+				}
+				if err == nil && uploader == nil {
+					err = errors.New("s3 client unavailable")
+				}
+				if err == nil {
+					body := autocapture.StreamTarGzip(dir, logMaxBytes)
+					key = autocapture.ObjectKey(hostname, req.Condition, time.Now())
+					err = autocapture.UploadStream(ctxCap, uploader, logBucket, key, body)
+					body.Close()
+				}
+
+				if err != nil {
+					logger.Error(err, "capture failed", "condition", req.Condition)
+				} else {
+					logger.Info("capture uploaded", "condition", req.Condition,
+						"bucket", logBucket, "key", key,
+						"failedCollectors", failed, "seconds", time.Since(start).Seconds())
+				}
 			}
 
 			// One capture at a time: each request is handled fully before the
@@ -225,32 +263,7 @@ func run() error {
 			for {
 				select {
 				case req := <-captureCh:
-					ctxCap, cancel := context.WithTimeout(ctx, 5*time.Minute)
-					logger.Info("capture started", "condition", req.Condition, "reason", req.Reason)
-					start := time.Now()
-					var key string
-					trigger := autocapture.Trigger{
-						Condition: req.Condition, Reason: req.Reason, Message: req.Message,
-						At: req.At, Node: hostname, NMAVersion: version.String(),
-					}
-					archive, failed, err := autocapture.Collect(ctxCap, runtimeContext, autocapture.CategoriesFor(req.Condition), trigger)
-					if err == nil && s3Client == nil {
-						err = errors.New("s3 client unavailable")
-					}
-					if err == nil {
-						ctxUp, cancelUp := context.WithTimeout(ctxCap, 2*time.Minute)
-						key = autocapture.ObjectKey(hostname, req.Condition, time.Now())
-						err = autocapture.Upload(ctxUp, s3Client, logBucket, key, archive)
-						cancelUp()
-					}
-					cancel()
-					if err != nil {
-						logger.Error(err, "capture failed", "condition", req.Condition)
-					} else {
-						logger.Info("capture uploaded", "condition", req.Condition,
-							"bucket", logBucket, "key", key,
-							"failedCollectors", failed, "seconds", time.Since(start).Seconds())
-					}
+					handleCapture(req)
 				case <-ctx.Done():
 					return nil
 				}
@@ -532,6 +545,7 @@ func parseFlags() error {
 	flagSet.StringVar(&controllerPprofAddress, "pprof-address", "", "Address for the controller runtime pprof endpoint (default disabled)")
 	flagSet.IntVarP(&verbosity, "verbosity", "v", 2, "Logging verbosity level")
 	flagSet.StringVar(&logBucket, "log-bucket", "", "S3 bucket for automatic log capture (empty = off)")
+	flagSet.Int64Var(&logMaxBytes, "log-max-bytes", 5<<30, "max compressed bundle size in bytes")
 	return flagSet.Parse(os.Args[1:])
 }
 

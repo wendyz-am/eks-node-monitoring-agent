@@ -1,14 +1,13 @@
 // Package autocapture implements the automatic log capture POC: when a managed
 // node condition flips into a failing state, a background worker collects the
-// relevant log categories, archives them, and (for now) writes the archive to
-// the node's disk. S3 upload and Events are added in later steps.
+// relevant log categories into a temp directory, then streams a gzipped tar of
+// that directory to S3 so memory stays flat regardless of bundle size.
 package autocapture
 
 import (
 	"bytes"
 	"context"
 	"fmt"
-	"io"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -21,7 +20,6 @@ import (
 	"github.com/aws/eks-node-monitoring-agent/pkg/config"
 	"github.com/aws/eks-node-monitoring-agent/pkg/log_collector/collect"
 	"github.com/aws/eks-node-monitoring-agent/pkg/logcollection"
-	fileutil "github.com/aws/eks-node-monitoring-agent/pkg/util/file"
 )
 
 // CategoriesFor returns the log categories to collect for a failed condition.
@@ -42,19 +40,22 @@ func CategoriesFor(condition corev1.NodeConditionType) []v1alpha1.LogCategory {
 	return categories
 }
 
-// Collect gathers the requested log categories from the host and returns an
-// in-memory tar.gz archive, the number of individual collectors that failed,
-// and an error. It mirrors the controller's collectLogs recipe: partial
-// collection failures are recorded in log-capture-errors.log inside the
-// archive rather than failing the whole capture.
-func Collect(ctx context.Context, runtimeContext *config.RuntimeContext, categories []v1alpha1.LogCategory, trigger Trigger) (io.Reader, int, error) {
+// CollectToDir gathers the requested log categories from the host into a fresh
+// temp directory and returns that directory, the number of individual
+// collectors that failed, and an error. It mirrors the controller's
+// collectLogs recipe: partial collection failures are recorded in
+// log-capture-errors.log inside the directory rather than failing the whole
+// capture.
+//
+// The caller owns the returned directory and must remove it. On an error
+// return, CollectToDir removes the directory itself and returns "".
+func CollectToDir(ctx context.Context, runtimeContext *config.RuntimeContext, categories []v1alpha1.LogCategory, trigger Trigger) (string, int, error) {
 	logger := log.FromContext(ctx)
 
 	logDir, err := os.MkdirTemp("", "eks-log-collector-*")
 	if err != nil {
-		return nil, 0, fmt.Errorf("failed creating temp directory due to: %s", err)
+		return "", 0, fmt.Errorf("failed creating temp directory due to: %s", err)
 	}
-	defer os.RemoveAll(logDir)
 
 	// The trigger file explains why the bundle was captured. It is best-effort:
 	// a bundle without it is still useful, so never fail the capture over it.
@@ -74,7 +75,8 @@ func Collect(ctx context.Context, runtimeContext *config.RuntimeContext, categor
 
 	acc, err := collect.NewAccessor(ctx, cfg)
 	if err != nil {
-		return nil, 0, fmt.Errorf("failed to create accessor: %s", err)
+		os.RemoveAll(logDir)
+		return "", 0, fmt.Errorf("failed to create accessor: %s", err)
 	}
 
 	// if there are any errors in the collection process they will be written to
@@ -95,14 +97,10 @@ func Collect(ctx context.Context, runtimeContext *config.RuntimeContext, categor
 	}
 	if errBuf.Len() > 0 {
 		if err := os.WriteFile(filepath.Join(logDir, logCaptureReportLog), errBuf.Bytes(), 0644); err != nil {
-			return nil, 0, fmt.Errorf("failed to write capture summary: %s", err)
+			os.RemoveAll(logDir)
+			return "", 0, fmt.Errorf("failed to write capture summary: %s", err)
 		}
 	}
 
-	archiveReader, err := fileutil.TarGzipDir(logDir)
-	if err != nil {
-		return nil, 0, fmt.Errorf("failed archiving logs due to: %s", err)
-	}
-
-	return archiveReader, subTasksFailed, nil
+	return logDir, subTasksFailed, nil
 }
