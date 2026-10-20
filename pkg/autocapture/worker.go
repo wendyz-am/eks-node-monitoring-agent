@@ -2,6 +2,7 @@ package autocapture
 
 import (
 	"context"
+	"os"
 	"time"
 
 	"github.com/go-logr/logr"
@@ -9,11 +10,15 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	"github.com/aws/eks-node-monitoring-agent/api/v1alpha1"
+	"github.com/aws/eks-node-monitoring-agent/pkg/config"
 	"github.com/aws/eks-node-monitoring-agent/pkg/manager"
 )
 
 // defaultCooldown keeps a flapping condition from uploading a bundle per flip.
 const defaultCooldown = 30 * time.Minute
+
+// captureTimeout only bounds a stuck or very large capture, not a target.
+const captureTimeout = 10 * time.Minute
 
 // Worker reacts to capture requests from the node exporter. For now it only
 // logs what it would capture; collection and upload arrive in a later change.
@@ -32,9 +37,12 @@ type Worker struct {
 	// extra capture per still-failing condition, not worth persisting for.
 	// No lock needed: only handle touches the map, on Start's one goroutine.
 	lastCapture map[corev1.NodeConditionType]time.Time
+
+	// A field so tests can swap in a fake and never read the real host.
+	collect func(ctx context.Context, categories []v1alpha1.LogCategory) (dir string, failed int, err error)
 }
 
-func NewWorker(requests <-chan manager.CaptureRequest, reader client.Reader, log logr.Logger) *Worker {
+func NewWorker(requests <-chan manager.CaptureRequest, reader client.Reader, runtimeContext *config.RuntimeContext, log logr.Logger) *Worker {
 	return &Worker{
 		requests:    requests,
 		client:      reader,
@@ -42,6 +50,9 @@ func NewWorker(requests <-chan manager.CaptureRequest, reader client.Reader, log
 		cooldown:    defaultCooldown,
 		now:         time.Now,
 		lastCapture: make(map[corev1.NodeConditionType]time.Time),
+		collect: func(ctx context.Context, categories []v1alpha1.LogCategory) (string, int, error) {
+			return CollectToDir(ctx, runtimeContext, categories)
+		},
 	}
 }
 
@@ -99,6 +110,28 @@ func (w *Worker) handle(ctx context.Context, req manager.CaptureRequest) {
 			"using", name, "ignored", ignored)
 		w.loggedIgnored = true
 	}
+
+	ctxCap, cancel := context.WithTimeout(ctx, captureTimeout)
+	defer cancel()
+	started := w.now()
+	dir, failed, err := w.collect(ctxCap, CategoriesFor(req.Condition))
+	if err != nil {
+		w.log.Error(err, "failed to collect logs for capture",
+			"condition", req.Condition, "reason", req.Reason)
+		return
+	}
+	// Delete the bundle here: nothing uploads it yet, so leaving it would fill
+	// the node's disk one capture at a time.
+	defer os.RemoveAll(dir)
+
+	files, bytes, err := dirSize(dir)
+	if err != nil {
+		w.log.Error(err, "failed to measure collected logs", "condition", req.Condition)
+	}
+	w.log.Info("capture collected",
+		"condition", req.Condition, "reason", req.Reason, "nodeDiagnostic", name,
+		"files", files, "bytes", bytes, "failedCollectors", failed,
+		"seconds", w.now().Sub(started).Seconds())
 }
 
 // findBucket returns the bucket for automatic log capture and the name of the

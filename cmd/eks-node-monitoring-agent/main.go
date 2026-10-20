@@ -204,7 +204,7 @@ func run() error {
 	// the worker drains it. The worker reads NodeDiagnostics through the
 	// manager's cached client.
 	captureCh := make(chan manager.CaptureRequest, 4)
-	captureWorker := autocapture.NewWorker(captureCh, mgr.GetClient(), logger.WithName("auto-log-capture"))
+	captureWorker := autocapture.NewWorker(captureCh, mgr.GetClient(), runtimeContext, logger.WithName("auto-log-capture"))
 	if err := mgr.Add(crmanager.RunnableFunc(captureWorker.Start)); err != nil {
 		logger.Error(err, "failed to add auto log capture worker")
 		return err

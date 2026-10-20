@@ -3,6 +3,9 @@ package autocapture
 import (
 	"context"
 	"errors"
+	"os"
+	"path/filepath"
+	"strconv"
 	"testing"
 	"time"
 
@@ -155,16 +158,34 @@ func (s *countingSink) Error(error, string, ...any)           {}
 func (s *countingSink) Info(level int, msg string, kv ...any) { s.counts[msg]++ }
 
 const (
-	msgOff     = "auto log capture is off: no NodeDiagnostic sets spec.autoLogCapture.bucket"
-	msgRequest = "capture requested"
-	msgSkip    = "capture skipped: cooldown active"
+	msgOff       = "auto log capture is off: no NodeDiagnostic sets spec.autoLogCapture.bucket"
+	msgRequest   = "capture requested"
+	msgSkip      = "capture skipped: cooldown active"
+	msgCollected = "capture collected"
 )
+
+// stubCollect replaces w.collect with one that records calls and creates a
+// temp dir with nFiles small files, so tests never read the real host.
+func stubCollect(t *testing.T, nFiles int) (fn func(context.Context, []v1alpha1.LogCategory) (string, int, error), calls *int) {
+	t.Helper()
+	n := 0
+	fn = func(context.Context, []v1alpha1.LogCategory) (string, int, error) {
+		n++
+		dir, err := os.MkdirTemp("", "autocapture-test-*")
+		require.NoError(t, err)
+		for i := 0; i < nFiles; i++ {
+			require.NoError(t, os.WriteFile(filepath.Join(dir, "f"+strconv.Itoa(i)), []byte("xx"), 0644))
+		}
+		return dir, 0, nil
+	}
+	return fn, &n
+}
 
 func TestWorker_NoBucketLogsOffOnce(t *testing.T) {
 	counts := map[string]int{}
 	ch := make(chan manager.CaptureRequest, 2)
 	c := fake.NewClientBuilder().WithScheme(testScheme(t)).Build()
-	w := NewWorker(ch, c, countingLogger(counts))
+	w := NewWorker(ch, c, nil, countingLogger(counts))
 
 	// Two requests with no bucket configured: the "off" message logs once.
 	req := manager.CaptureRequest{Condition: "NetworkingReady", Reason: "Down", At: time.Now()}
@@ -180,7 +201,9 @@ func TestWorker_BucketHandlesRequest(t *testing.T) {
 	ch := make(chan manager.CaptureRequest, 1)
 	c := fake.NewClientBuilder().WithScheme(testScheme(t)).
 		WithObjects(autoLogDiagnostic("alpha", "my-bucket", time.Unix(100, 0))).Build()
-	w := NewWorker(ch, c, countingLogger(counts))
+	w := NewWorker(ch, c, nil, countingLogger(counts))
+	collectFn, _ := stubCollect(t, 0)
+	w.collect = collectFn
 
 	w.handle(context.Background(), manager.CaptureRequest{Condition: "NetworkingReady", Reason: "Down", At: time.Now()})
 
@@ -191,7 +214,7 @@ func TestWorker_BucketHandlesRequest(t *testing.T) {
 func TestWorker_StartReturnsNilOnCancel(t *testing.T) {
 	ch := make(chan manager.CaptureRequest)
 	c := fake.NewClientBuilder().WithScheme(testScheme(t)).Build()
-	w := NewWorker(ch, c, logr.Discard())
+	w := NewWorker(ch, c, nil, logr.Discard())
 
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)
@@ -262,7 +285,9 @@ func TestWorker_Cooldown(t *testing.T) {
 			counts := map[string]int{}
 			c := fake.NewClientBuilder().WithScheme(testScheme(t)).
 				WithObjects(autoLogDiagnostic("alpha", "my-bucket", time.Unix(100, 0))).Build()
-			w := NewWorker(make(chan manager.CaptureRequest), c, countingLogger(counts))
+			w := NewWorker(make(chan manager.CaptureRequest), c, nil, countingLogger(counts))
+			collectFn, _ := stubCollect(t, 0)
+			w.collect = collectFn
 
 			var cur time.Time
 			w.now = func() time.Time { return cur }
@@ -282,7 +307,9 @@ func TestWorker_NoBucketDoesNotStartCooldown(t *testing.T) {
 	// A NodeDiagnostic whose bucket we flip on later, backing the same client.
 	nd := autoLogDiagnostic("alpha", "", time.Unix(100, 0))
 	c := fake.NewClientBuilder().WithScheme(testScheme(t)).WithObjects(nd).Build()
-	w := NewWorker(make(chan manager.CaptureRequest), c, countingLogger(counts))
+	w := NewWorker(make(chan manager.CaptureRequest), c, nil, countingLogger(counts))
+	collectFn, _ := stubCollect(t, 0)
+	w.collect = collectFn
 
 	cur := time.Unix(1_000_000, 0)
 	w.now = func() time.Time { return cur }
@@ -300,4 +327,86 @@ func TestWorker_NoBucketDoesNotStartCooldown(t *testing.T) {
 	w.handle(context.Background(), manager.CaptureRequest{Condition: "NetworkingReady", Reason: "Down"})
 	assert.Equal(t, 1, counts[msgRequest], "a request after a bucket is set must be handled")
 	assert.Equal(t, 0, counts[msgSkip])
+}
+
+func bucketClient(t *testing.T) client.Client {
+	t.Helper()
+	return fake.NewClientBuilder().WithScheme(testScheme(t)).
+		WithObjects(autoLogDiagnostic("alpha", "my-bucket", time.Unix(100, 0))).Build()
+}
+
+func TestWorker_CollectsAndDeletesOnBucket(t *testing.T) {
+	counts := map[string]int{}
+	w := NewWorker(make(chan manager.CaptureRequest), bucketClient(t), nil, countingLogger(counts))
+
+	var capturedDir string
+	collectFn, calls := stubCollect(t, 2)
+	w.collect = func(ctx context.Context, cats []v1alpha1.LogCategory) (string, int, error) {
+		dir, failed, err := collectFn(ctx, cats)
+		capturedDir = dir
+		return dir, failed, err
+	}
+
+	w.handle(context.Background(), manager.CaptureRequest{Condition: "NetworkingReady", Reason: "Down"})
+
+	assert.Equal(t, 1, *calls, "collect must be called once")
+	assert.Equal(t, 1, counts[msgCollected], "a successful collect must log 'capture collected'")
+	_, statErr := os.Stat(capturedDir)
+	assert.True(t, os.IsNotExist(statErr), "the collected folder must be deleted afterwards")
+}
+
+func TestWorker_NoBucketDoesNotCollect(t *testing.T) {
+	counts := map[string]int{}
+	c := fake.NewClientBuilder().WithScheme(testScheme(t)).Build()
+	w := NewWorker(make(chan manager.CaptureRequest), c, nil, countingLogger(counts))
+	collectFn, calls := stubCollect(t, 1)
+	w.collect = collectFn
+
+	w.handle(context.Background(), manager.CaptureRequest{Condition: "NetworkingReady", Reason: "Down"})
+
+	assert.Equal(t, 0, *calls, "no bucket must not trigger collection")
+	assert.Equal(t, 0, counts[msgCollected])
+}
+
+func TestWorker_CooldownDoesNotCollect(t *testing.T) {
+	counts := map[string]int{}
+	w := NewWorker(make(chan manager.CaptureRequest), bucketClient(t), nil, countingLogger(counts))
+	collectFn, calls := stubCollect(t, 1)
+	w.collect = collectFn
+
+	cur := time.Unix(1_000_000, 0)
+	w.now = func() time.Time { return cur }
+	req := manager.CaptureRequest{Condition: "NetworkingReady", Reason: "Down"}
+
+	w.handle(context.Background(), req)
+	cur = cur.Add(1 * time.Minute) // inside the cooldown window
+	w.handle(context.Background(), req)
+
+	assert.Equal(t, 1, *calls, "a request inside the cooldown must not collect again")
+}
+
+func TestWorker_CollectErrorIsLoggedNotFatal(t *testing.T) {
+	counts := map[string]int{}
+	w := NewWorker(make(chan manager.CaptureRequest), bucketClient(t), nil, countingLogger(counts))
+	w.collect = func(context.Context, []v1alpha1.LogCategory) (string, int, error) {
+		return "", 0, errors.New("collect boom")
+	}
+
+	// Must not panic; the error path returns before "capture collected".
+	w.handle(context.Background(), manager.CaptureRequest{Condition: "NetworkingReady", Reason: "Down"})
+	assert.Equal(t, 0, counts[msgCollected], "a collect error must not log a successful collection")
+}
+
+func TestDirSize(t *testing.T) {
+	dir := t.TempDir()
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "a"), []byte("12345"), 0644)) // 5 bytes
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "b"), []byte("678"), 0644))   // 3 bytes
+	sub := filepath.Join(dir, "sub")
+	require.NoError(t, os.Mkdir(sub, 0755))
+	require.NoError(t, os.WriteFile(filepath.Join(sub, "c"), []byte("90"), 0644)) // 2 bytes
+
+	files, bytes, err := dirSize(dir)
+	require.NoError(t, err)
+	assert.Equal(t, 3, files)
+	assert.Equal(t, int64(10), bytes)
 }
