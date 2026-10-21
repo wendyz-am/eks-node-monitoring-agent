@@ -38,7 +38,7 @@ func CategoriesFor(condition corev1.NodeConditionType) []v1alpha1.LogCategory {
 // CollectToDir gathers the requested log categories into a fresh temp
 // directory and returns it, the number of collectors that failed, and an
 // error. The caller owns the directory and must remove it.
-func CollectToDir(ctx context.Context, runtimeContext *config.RuntimeContext, categories []v1alpha1.LogCategory) (dir string, failed int, err error) {
+func CollectToDir(ctx context.Context, runtimeContext *config.RuntimeContext, categories []v1alpha1.LogCategory, trigger Trigger) (dir string, failed int, err error) {
 	logger := log.FromContext(ctx)
 
 	logDir, err := os.MkdirTemp("", "eks-log-collector-*")
@@ -88,6 +88,14 @@ func CollectToDir(ctx context.Context, runtimeContext *config.RuntimeContext, ca
 			os.RemoveAll(logDir)
 			return "", 0, fmt.Errorf("failed to write capture summary: %s", err)
 		}
+	}
+
+	// Written after collection so a failed collector never stops it. Best
+	// effort: the bundle itself is the valuable part, and discarding it over
+	// one small file write would cost more than the write failure itself,
+	// especially on a node that's already in trouble.
+	if err := writeTrigger(logDir, trigger); err != nil {
+		logger.Error(err, "failed to write capture trigger")
 	}
 	return logDir, subTasksFailed, nil
 }

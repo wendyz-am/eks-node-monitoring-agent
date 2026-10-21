@@ -10,6 +10,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	"github.com/aws/eks-node-monitoring-agent/api/v1alpha1"
+	"github.com/aws/eks-node-monitoring-agent/internal/version"
 	"github.com/aws/eks-node-monitoring-agent/pkg/config"
 	"github.com/aws/eks-node-monitoring-agent/pkg/manager"
 	"github.com/aws/eks-node-monitoring-agent/pkg/util/captureguard"
@@ -27,6 +28,7 @@ const defaultCaptureTimeout = 10 * time.Minute
 type Worker struct {
 	requests <-chan manager.CaptureRequest
 	client   client.Reader
+	nodeName string
 	log      logr.Logger
 
 	// guard is shared with the NodeDiagnostic controller, so the two never
@@ -49,21 +51,22 @@ type Worker struct {
 	lastCapture map[corev1.NodeConditionType]time.Time
 
 	// A field so tests can swap in a fake and never read the real host.
-	collect func(ctx context.Context, categories []v1alpha1.LogCategory) (dir string, failed int, err error)
+	collect func(ctx context.Context, categories []v1alpha1.LogCategory, trigger Trigger) (dir string, failed int, err error)
 }
 
-func NewWorker(requests <-chan manager.CaptureRequest, reader client.Reader, runtimeContext *config.RuntimeContext, guard *captureguard.Guard, log logr.Logger) *Worker {
+func NewWorker(requests <-chan manager.CaptureRequest, reader client.Reader, runtimeContext *config.RuntimeContext, guard *captureguard.Guard, nodeName string, log logr.Logger) *Worker {
 	return &Worker{
 		requests:       requests,
 		client:         reader,
+		nodeName:       nodeName,
 		log:            log,
 		guard:          guard,
 		cooldown:       defaultCooldown,
 		now:            time.Now,
 		captureTimeout: defaultCaptureTimeout,
 		lastCapture:    make(map[corev1.NodeConditionType]time.Time),
-		collect: func(ctx context.Context, categories []v1alpha1.LogCategory) (string, int, error) {
-			return CollectToDir(ctx, runtimeContext, categories)
+		collect: func(ctx context.Context, categories []v1alpha1.LogCategory, trigger Trigger) (string, int, error) {
+			return CollectToDir(ctx, runtimeContext, categories, trigger)
 		},
 	}
 }
@@ -137,6 +140,15 @@ func (w *Worker) handle(ctx context.Context, req manager.CaptureRequest) {
 	defer cancel()
 	started := w.now()
 
+	trigger := Trigger{
+		Condition:  req.Condition,
+		Reason:     req.Reason,
+		Message:    req.Message,
+		At:         req.At,
+		Node:       w.nodeName,
+		NMAVersion: version.String(),
+	}
+
 	type collectResult struct {
 		dir    string
 		failed int
@@ -144,7 +156,7 @@ func (w *Worker) handle(ctx context.Context, req manager.CaptureRequest) {
 	}
 	done := make(chan collectResult, 1)
 	go func() {
-		dir, failed, err := w.collect(ctxCap, CategoriesFor(req.Condition))
+		dir, failed, err := w.collect(ctxCap, CategoriesFor(req.Condition), trigger)
 		// Released before publishing, so a caller which receives the result
 		// always observes the collection as free again. TryAcquire stays
 		// where it is above: nothing between it and this goroutine starting

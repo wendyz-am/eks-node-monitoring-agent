@@ -193,10 +193,10 @@ func (s *recordingSink) Error(err error, msg string, kv ...any) {
 
 // stubCollect replaces w.collect with one that records calls and creates a
 // temp dir with nFiles small files, so tests never read the real host.
-func stubCollect(t *testing.T, nFiles int) (fn func(context.Context, []v1alpha1.LogCategory) (string, int, error), calls *int) {
+func stubCollect(t *testing.T, nFiles int) (fn func(context.Context, []v1alpha1.LogCategory, Trigger) (string, int, error), calls *int) {
 	t.Helper()
 	n := 0
-	fn = func(context.Context, []v1alpha1.LogCategory) (string, int, error) {
+	fn = func(context.Context, []v1alpha1.LogCategory, Trigger) (string, int, error) {
 		n++
 		dir, err := os.MkdirTemp("", "autocapture-test-*")
 		require.NoError(t, err)
@@ -212,7 +212,7 @@ func TestWorker_NoBucketLogsOffOnce(t *testing.T) {
 	counts := map[string]int{}
 	ch := make(chan manager.CaptureRequest, 2)
 	c := fake.NewClientBuilder().WithScheme(testScheme(t)).Build()
-	w := NewWorker(ch, c, nil, &captureguard.Guard{}, countingLogger(counts))
+	w := NewWorker(ch, c, nil, &captureguard.Guard{}, "node-1", countingLogger(counts))
 
 	// Two requests with no bucket configured: the "off" message logs once.
 	req := manager.CaptureRequest{Condition: "NetworkingReady", Reason: "Down", At: time.Now()}
@@ -228,7 +228,7 @@ func TestWorker_BucketHandlesRequest(t *testing.T) {
 	ch := make(chan manager.CaptureRequest, 1)
 	c := fake.NewClientBuilder().WithScheme(testScheme(t)).
 		WithObjects(autoLogDiagnostic("alpha", "my-bucket", time.Unix(100, 0))).Build()
-	w := NewWorker(ch, c, nil, &captureguard.Guard{}, countingLogger(counts))
+	w := NewWorker(ch, c, nil, &captureguard.Guard{}, "node-1", countingLogger(counts))
 	collectFn, _ := stubCollect(t, 0)
 	w.collect = collectFn
 
@@ -241,7 +241,7 @@ func TestWorker_BucketHandlesRequest(t *testing.T) {
 func TestWorker_StartReturnsNilOnCancel(t *testing.T) {
 	ch := make(chan manager.CaptureRequest)
 	c := fake.NewClientBuilder().WithScheme(testScheme(t)).Build()
-	w := NewWorker(ch, c, nil, &captureguard.Guard{}, logr.Discard())
+	w := NewWorker(ch, c, nil, &captureguard.Guard{}, "node-1", logr.Discard())
 
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)
@@ -312,7 +312,7 @@ func TestWorker_Cooldown(t *testing.T) {
 			counts := map[string]int{}
 			c := fake.NewClientBuilder().WithScheme(testScheme(t)).
 				WithObjects(autoLogDiagnostic("alpha", "my-bucket", time.Unix(100, 0))).Build()
-			w := NewWorker(make(chan manager.CaptureRequest), c, nil, &captureguard.Guard{}, countingLogger(counts))
+			w := NewWorker(make(chan manager.CaptureRequest), c, nil, &captureguard.Guard{}, "node-1", countingLogger(counts))
 			collectFn, _ := stubCollect(t, 0)
 			w.collect = collectFn
 
@@ -334,7 +334,7 @@ func TestWorker_NoBucketDoesNotStartCooldown(t *testing.T) {
 	// A NodeDiagnostic whose bucket we flip on later, backing the same client.
 	nd := autoLogDiagnostic("alpha", "", time.Unix(100, 0))
 	c := fake.NewClientBuilder().WithScheme(testScheme(t)).WithObjects(nd).Build()
-	w := NewWorker(make(chan manager.CaptureRequest), c, nil, &captureguard.Guard{}, countingLogger(counts))
+	w := NewWorker(make(chan manager.CaptureRequest), c, nil, &captureguard.Guard{}, "node-1", countingLogger(counts))
 	collectFn, _ := stubCollect(t, 0)
 	w.collect = collectFn
 
@@ -362,14 +362,45 @@ func bucketClient(t *testing.T) client.Client {
 		WithObjects(autoLogDiagnostic("alpha", "my-bucket", time.Unix(100, 0))).Build()
 }
 
+// TestWorker_BuildsTriggerFromRequest confirms the worker threads the
+// CaptureRequest's Condition/Reason/Message/At into the Trigger passed to
+// collect, and fills Node/NMAVersion from the worker's own construction
+// rather than leaving them empty.
+func TestWorker_BuildsTriggerFromRequest(t *testing.T) {
+	counts := map[string]int{}
+	w := NewWorker(make(chan manager.CaptureRequest), bucketClient(t), nil, &captureguard.Guard{}, "node-1", countingLogger(counts))
+
+	var gotTrigger Trigger
+	collectFn, _ := stubCollect(t, 0)
+	w.collect = func(ctx context.Context, cats []v1alpha1.LogCategory, trig Trigger) (string, int, error) {
+		gotTrigger = trig
+		return collectFn(ctx, cats, trig)
+	}
+
+	at := time.Now()
+	w.handle(context.Background(), manager.CaptureRequest{
+		Condition: "NetworkingReady",
+		Reason:    "InterfaceDown",
+		Message:   "eth0 is down",
+		At:        at,
+	})
+
+	assert.Equal(t, corev1.NodeConditionType("NetworkingReady"), gotTrigger.Condition)
+	assert.Equal(t, "InterfaceDown", gotTrigger.Reason)
+	assert.Equal(t, "eth0 is down", gotTrigger.Message)
+	assert.Equal(t, at, gotTrigger.At)
+	assert.Equal(t, "node-1", gotTrigger.Node, "Node must come from the worker's configured node name")
+	assert.NotEmpty(t, gotTrigger.NMAVersion, "NMAVersion must be populated")
+}
+
 func TestWorker_CollectsAndDeletesOnBucket(t *testing.T) {
 	counts := map[string]int{}
-	w := NewWorker(make(chan manager.CaptureRequest), bucketClient(t), nil, &captureguard.Guard{}, countingLogger(counts))
+	w := NewWorker(make(chan manager.CaptureRequest), bucketClient(t), nil, &captureguard.Guard{}, "node-1", countingLogger(counts))
 
 	var capturedDir string
 	collectFn, calls := stubCollect(t, 2)
-	w.collect = func(ctx context.Context, cats []v1alpha1.LogCategory) (string, int, error) {
-		dir, failed, err := collectFn(ctx, cats)
+	w.collect = func(ctx context.Context, cats []v1alpha1.LogCategory, trig Trigger) (string, int, error) {
+		dir, failed, err := collectFn(ctx, cats, trig)
 		capturedDir = dir
 		return dir, failed, err
 	}
@@ -387,7 +418,7 @@ func TestWorker_GuardHeldSkipsCollectionAndFreesCooldown(t *testing.T) {
 	guard := &captureguard.Guard{}
 	ch := make(chan manager.CaptureRequest)
 	c := bucketClient(t)
-	w := NewWorker(ch, c, nil, guard, countingLogger(counts))
+	w := NewWorker(ch, c, nil, guard, "node-1", countingLogger(counts))
 	collectFn, calls := stubCollect(t, 0)
 	w.collect = collectFn
 
@@ -412,11 +443,11 @@ func TestWorker_GuardHeldSkipsCollectionAndFreesCooldown(t *testing.T) {
 func TestWorker_GuardFreedAfterHandleReturns(t *testing.T) {
 	for _, tc := range []struct {
 		name    string
-		collect func(context.Context, []v1alpha1.LogCategory) (string, int, error)
+		collect func(context.Context, []v1alpha1.LogCategory, Trigger) (string, int, error)
 	}{
 		{
 			name: "success",
-			collect: func(context.Context, []v1alpha1.LogCategory) (string, int, error) {
+			collect: func(context.Context, []v1alpha1.LogCategory, Trigger) (string, int, error) {
 				dir, err := os.MkdirTemp("", "autocapture-guard-test-*")
 				require.NoError(t, err)
 				return dir, 0, nil
@@ -424,7 +455,7 @@ func TestWorker_GuardFreedAfterHandleReturns(t *testing.T) {
 		},
 		{
 			name: "collect error",
-			collect: func(context.Context, []v1alpha1.LogCategory) (string, int, error) {
+			collect: func(context.Context, []v1alpha1.LogCategory, Trigger) (string, int, error) {
 				return "", 0, errors.New("collect boom")
 			},
 		},
@@ -432,11 +463,11 @@ func TestWorker_GuardFreedAfterHandleReturns(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			counts := map[string]int{}
 			guard := &captureguard.Guard{}
-			w := NewWorker(make(chan manager.CaptureRequest), bucketClient(t), nil, guard, countingLogger(counts))
+			w := NewWorker(make(chan manager.CaptureRequest), bucketClient(t), nil, guard, "node-1", countingLogger(counts))
 			calls := 0
-			w.collect = func(ctx context.Context, cats []v1alpha1.LogCategory) (string, int, error) {
+			w.collect = func(ctx context.Context, cats []v1alpha1.LogCategory, trig Trigger) (string, int, error) {
 				calls++
-				return tc.collect(ctx, cats)
+				return tc.collect(ctx, cats, trig)
 			}
 
 			w.handle(context.Background(), manager.CaptureRequest{Condition: "NetworkingReady", Reason: "Down"})
@@ -456,12 +487,12 @@ func TestWorker_GuardFreedAfterHandleReturns(t *testing.T) {
 func TestWorker_GuardHeldUntilCollectReturns(t *testing.T) {
 	counts := map[string]int{}
 	guard := &captureguard.Guard{}
-	w := NewWorker(make(chan manager.CaptureRequest), bucketClient(t), nil, guard, countingLogger(counts))
+	w := NewWorker(make(chan manager.CaptureRequest), bucketClient(t), nil, guard, "node-1", countingLogger(counts))
 	w.captureTimeout = 10 * time.Millisecond
 
 	release := make(chan struct{})
 	returned := make(chan struct{})
-	w.collect = func(ctx context.Context, _ []v1alpha1.LogCategory) (string, int, error) {
+	w.collect = func(ctx context.Context, _ []v1alpha1.LogCategory, _ Trigger) (string, int, error) {
 		<-release
 		close(returned)
 		return "", 0, errors.New("collect boom")
@@ -498,7 +529,7 @@ func TestWorker_GuardHeldUntilCollectReturns(t *testing.T) {
 func TestWorker_NoBucketDoesNotCollect(t *testing.T) {
 	counts := map[string]int{}
 	c := fake.NewClientBuilder().WithScheme(testScheme(t)).Build()
-	w := NewWorker(make(chan manager.CaptureRequest), c, nil, &captureguard.Guard{}, countingLogger(counts))
+	w := NewWorker(make(chan manager.CaptureRequest), c, nil, &captureguard.Guard{}, "node-1", countingLogger(counts))
 	collectFn, calls := stubCollect(t, 1)
 	w.collect = collectFn
 
@@ -510,7 +541,7 @@ func TestWorker_NoBucketDoesNotCollect(t *testing.T) {
 
 func TestWorker_CooldownDoesNotCollect(t *testing.T) {
 	counts := map[string]int{}
-	w := NewWorker(make(chan manager.CaptureRequest), bucketClient(t), nil, &captureguard.Guard{}, countingLogger(counts))
+	w := NewWorker(make(chan manager.CaptureRequest), bucketClient(t), nil, &captureguard.Guard{}, "node-1", countingLogger(counts))
 	collectFn, calls := stubCollect(t, 1)
 	w.collect = collectFn
 
@@ -528,9 +559,9 @@ func TestWorker_CooldownDoesNotCollect(t *testing.T) {
 func TestWorker_CollectErrorIsLoggedNotFatal(t *testing.T) {
 	counts := map[string]int{}
 	errs := map[string]error{}
-	w := NewWorker(make(chan manager.CaptureRequest), bucketClient(t), nil, &captureguard.Guard{}, recordingLogger(counts, errs))
+	w := NewWorker(make(chan manager.CaptureRequest), bucketClient(t), nil, &captureguard.Guard{}, "node-1", recordingLogger(counts, errs))
 	wantErr := errors.New("collect boom")
-	w.collect = func(context.Context, []v1alpha1.LogCategory) (string, int, error) {
+	w.collect = func(context.Context, []v1alpha1.LogCategory, Trigger) (string, int, error) {
 		return "", 0, wantErr
 	}
 
@@ -546,12 +577,12 @@ func TestWorker_CollectErrorIsLoggedNotFatal(t *testing.T) {
 // the stuck collect eventually creates is still removed once it finishes.
 func TestWorker_CollectTimeoutReturnsAndCleansUp(t *testing.T) {
 	counts := map[string]int{}
-	w := NewWorker(make(chan manager.CaptureRequest), bucketClient(t), nil, &captureguard.Guard{}, countingLogger(counts))
+	w := NewWorker(make(chan manager.CaptureRequest), bucketClient(t), nil, &captureguard.Guard{}, "node-1", countingLogger(counts))
 	w.captureTimeout = 10 * time.Millisecond
 
 	var capturedDir string
 	finished := make(chan struct{})
-	w.collect = func(ctx context.Context, _ []v1alpha1.LogCategory) (string, int, error) {
+	w.collect = func(ctx context.Context, _ []v1alpha1.LogCategory, _ Trigger) (string, int, error) {
 		<-ctx.Done() // block until handle's timeout fires
 		dir, err := os.MkdirTemp("", "autocapture-timeout-test-*")
 		require.NoError(t, err)
@@ -593,11 +624,11 @@ func TestWorker_CollectTimeoutReturnsAndCleansUp(t *testing.T) {
 func TestWorker_CollectRaceWithTimeoutStillCleansUp(t *testing.T) {
 	for i := 0; i < 50; i++ {
 		counts := map[string]int{}
-		w := NewWorker(make(chan manager.CaptureRequest), bucketClient(t), nil, &captureguard.Guard{}, countingLogger(counts))
+		w := NewWorker(make(chan manager.CaptureRequest), bucketClient(t), nil, &captureguard.Guard{}, "node-1", countingLogger(counts))
 		w.captureTimeout = time.Millisecond
 
 		dirCh := make(chan string, 1)
-		w.collect = func(context.Context, []v1alpha1.LogCategory) (string, int, error) {
+		w.collect = func(context.Context, []v1alpha1.LogCategory, Trigger) (string, int, error) {
 			dir, err := os.MkdirTemp("", "autocapture-race-test-*")
 			require.NoError(t, err)
 			dirCh <- dir
